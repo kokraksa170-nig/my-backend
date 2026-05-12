@@ -17,7 +17,10 @@ mongoose.connect(process.env.MONGO_URL)
 const productSchema = new mongoose.Schema({
   name: String,
   price: Number,
-  image: String
+  image: String,
+  category: { type: String, default: "General" },
+  description: { type: String, default: "" },
+  stock: { type: Number, default: 10 }
 });
 const Product = mongoose.model("Product", productSchema);
 
@@ -25,6 +28,7 @@ const orderSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   items: Array,
   total: Number,
+  status: { type: String, default: "pending" },
   createdAt: { type: Date, default: Date.now }
 });
 const Order = mongoose.model("Order", orderSchema);
@@ -106,12 +110,22 @@ app.get("/products", async (req, res) => {
   }
 });
 
+app.get("/products/:id", async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ message: "Product not found ❌" });
+    res.json(product);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/products", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { name, price, image } = req.body;
+    const { name, price, image, category, description, stock } = req.body;
     if (!name || !price || !image)
       return res.status(400).json({ message: "All fields are required ❌" });
-    const newProduct = new Product({ name, price, image });
+    const newProduct = new Product({ name, price, image, category: category || "General", description: description || "", stock: stock || 10 });
     await newProduct.save();
     res.json({ message: "Product added successfully ✅", product: newProduct });
   } catch (err) {
@@ -121,12 +135,12 @@ app.post("/products", authMiddleware, adminMiddleware, async (req, res) => {
 
 app.put("/products/:id", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { name, price, image } = req.body;
+    const { name, price, image, category, description, stock } = req.body;
     if (!name || !price || !image)
       return res.status(400).json({ message: "All fields are required ❌" });
     const updated = await Product.findByIdAndUpdate(
       req.params.id,
-      { name, price, image },
+      { name, price, image, category: category || "General", description: description || "", stock: stock || 0 },
       { new: true }
     );
     res.json({ message: "Product updated ✅", product: updated });
@@ -147,9 +161,30 @@ app.delete("/products/:id", authMiddleware, adminMiddleware, async (req, res) =>
 app.get("/seed", async (req, res) => {
   await Product.deleteMany();
   await Product.insertMany([
-    { name: "Running Shoes", price: 50, image: "https://images.unsplash.com/photo-1542291026-7eec264c27ff" },
-    { name: "Casual Shirt", price: 25, image: "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab" },
-    { name: "Luxury Watch", price: 100, image: "https://images.unsplash.com/photo-1548036328-c9fa89d128fa" }
+    {
+      name: "Running Shoes",
+      price: 50,
+      image: "https://images.unsplash.com/photo-1542291026-7eec264c27ff",
+      category: "Shoes",
+      description: "High-performance running shoes with superior cushioning and breathable mesh upper. Perfect for daily runs and marathon training.",
+      stock: 15
+    },
+    {
+      name: "Casual Shirt",
+      price: 25,
+      image: "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab",
+      category: "Clothing",
+      description: "Classic casual shirt made from 100% premium cotton. Comfortable fit perfect for everyday wear.",
+      stock: 30
+    },
+    {
+      name: "Luxury Watch",
+      price: 100,
+      image: "https://images.unsplash.com/photo-1548036328-c9fa89d128fa",
+      category: "Accessories",
+      description: "Elegant luxury timepiece with sapphire crystal glass and stainless steel bracelet. Water resistant up to 50 meters.",
+      stock: 5
+    }
   ]);
   res.send("Seeded ✅");
 });
@@ -161,13 +196,20 @@ app.post("/orders", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "Cart is empty ❌" });
     const productIds = items.map(i => i._id);
     const dbProducts = await Product.find({ _id: { $in: productIds } });
+    for (const item of items) {
+      const real = dbProducts.find(p => p._id.toString() === item._id);
+      if (!real) return res.status(400).json({ message: "Product not found ❌" });
+      if (real.stock < item.qty) return res.status(400).json({ message: `Not enough stock for ${real.name} ❌` });
+    }
     const verifiedItems = items.map(item => {
       const real = dbProducts.find(p => p._id.toString() === item._id);
-      if (!real) throw new Error("Product not found");
       return { _id: item._id, name: real.name, price: real.price, qty: item.qty };
     });
     const total = verifiedItems.reduce((sum, item) => sum + item.price * item.qty, 0);
-    const newOrder = new Order({ userId: req.user.id, items: verifiedItems, total });
+    for (const item of verifiedItems) {
+      await Product.findByIdAndUpdate(item._id, { $inc: { stock: -item.qty } });
+    }
+    const newOrder = new Order({ userId: req.user.id, items: verifiedItems, total, status: "pending" });
     await newOrder.save();
     res.json({ message: "Order saved successfully ✅", order: newOrder });
   } catch (err) {
@@ -180,6 +222,19 @@ app.get("/orders", authMiddleware, async (req, res) => {
     const query = req.user.isAdmin ? {} : { userId: req.user.id };
     const orders = await Order.find(query).sort({ createdAt: -1 });
     res.json(orders);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/orders/:id/status", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const validStatuses = ["pending", "shipped", "delivered"];
+    if (!validStatuses.includes(status))
+      return res.status(400).json({ message: "Invalid status ❌" });
+    const updated = await Order.findByIdAndUpdate(req.params.id, { status }, { new: true });
+    res.json({ message: "Order status updated ✅", order: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

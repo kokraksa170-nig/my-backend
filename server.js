@@ -14,14 +14,34 @@ mongoose.connect(process.env.MONGO_URL)
   .then(() => console.log("MongoDB Connected ✅"))
   .catch(err => console.log(err));
 
+/* =======================
+   MODELS
+======================= */
 const productSchema = new mongoose.Schema({
   name: String,
   price: Number,
   image: String,
   category: { type: String, default: "General" },
   description: { type: String, default: "" },
-  stock: { type: Number, default: 10 }
+  stock: { type: Number, default: 10 },
+  ratings: [
+    {
+      userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+      stars: { type: Number, min: 1, max: 5 },
+      comment: String,
+      createdAt: { type: Date, default: Date.now }
+    }
+  ]
 });
+
+// ✅ Virtual average rating
+productSchema.virtual("avgRating").get(function () {
+  if (!this.ratings.length) return 0;
+  return this.ratings.reduce((sum, r) => sum + r.stars, 0) / this.ratings.length;
+});
+
+productSchema.set("toJSON", { virtuals: true });
+
 const Product = mongoose.model("Product", productSchema);
 
 const orderSchema = new mongoose.Schema({
@@ -41,6 +61,9 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
+/* =======================
+   MIDDLEWARE
+======================= */
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "No token ❌" });
@@ -58,8 +81,14 @@ function adminMiddleware(req, res, next) {
   next();
 }
 
+/* =======================
+   ROOT
+======================= */
 app.get("/", (req, res) => res.send("API is running 🚀"));
 
+/* =======================
+   AUTH
+======================= */
 app.post("/register", async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -91,16 +120,19 @@ app.post("/login", async (req, res) => {
     if (!match)
       return res.status(400).json({ message: "Wrong password ❌" });
     const token = jwt.sign(
-      { id: user._id, email: user.email, isAdmin: user.isAdmin },
+      { id: user._id, email: user.email, isAdmin: user.isAdmin, name: user.name },
       process.env.JWT_SECRET || "secret123",
       { expiresIn: "7d" }
     );
-    res.json({ token, isAdmin: user.isAdmin, message: "Login successful ✅" });
+    res.json({ token, isAdmin: user.isAdmin, name: user.name, message: "Login successful ✅" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+/* =======================
+   PRODUCTS
+======================= */
 app.get("/products", async (req, res) => {
   try {
     const products = await Product.find();
@@ -158,6 +190,35 @@ app.delete("/products/:id", authMiddleware, adminMiddleware, async (req, res) =>
   }
 });
 
+// ✅ Add rating
+app.post("/products/:id/rating", authMiddleware, async (req, res) => {
+  try {
+    const { stars, comment } = req.body;
+    if (!stars || stars < 1 || stars > 5)
+      return res.status(400).json({ message: "Stars must be 1-5 ❌" });
+
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ message: "Product not found ❌" });
+
+    // Check if user already rated
+    const existing = product.ratings.find(r => r.userId.toString() === req.user.id);
+    if (existing) {
+      existing.stars = stars;
+      existing.comment = comment;
+    } else {
+      product.ratings.push({ userId: req.user.id, stars, comment });
+    }
+
+    await product.save();
+    res.json({ message: "Rating submitted ✅", product });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =======================
+   SEED
+======================= */
 app.get("/seed", async (req, res) => {
   await Product.deleteMany();
   await Product.insertMany([
@@ -189,6 +250,9 @@ app.get("/seed", async (req, res) => {
   res.send("Seeded ✅");
 });
 
+/* =======================
+   ORDERS
+======================= */
 app.post("/orders", authMiddleware, async (req, res) => {
   try {
     const { items } = req.body;
@@ -240,4 +304,57 @@ app.put("/orders/:id/status", authMiddleware, adminMiddleware, async (req, res) 
   }
 });
 
+/* =======================
+   ANALYTICS (admin only)
+======================= */
+app.get("/analytics", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const orders = await Order.find();
+    const products = await Product.find();
+    const users = await User.find();
+
+    const totalRevenue = orders.reduce((sum, o) => sum + o.total, 0);
+    const totalOrders = orders.length;
+    const totalProducts = products.length;
+    const totalUsers = users.length;
+
+    // Orders by status
+    const statusCounts = { pending: 0, shipped: 0, delivered: 0 };
+    orders.forEach(o => { if (statusCounts[o.status] !== undefined) statusCounts[o.status]++; });
+
+    // Top products by revenue
+    const productRevenue = {};
+    orders.forEach(order => {
+      order.items.forEach(item => {
+        if (!productRevenue[item.name]) productRevenue[item.name] = 0;
+        productRevenue[item.name] += item.price * item.qty;
+      });
+    });
+
+    const topProducts = Object.entries(productRevenue)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([name, revenue]) => ({ name, revenue }));
+
+    // Revenue by day (last 7 days)
+    const last7Days = [];
+    for (let i = 6; i >= 0; i--) {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      const dateStr = date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const dayRevenue = orders
+        .filter(o => new Date(o.createdAt).toDateString() === date.toDateString())
+        .reduce((sum, o) => sum + o.total, 0);
+      last7Days.push({ date: dateStr, revenue: dayRevenue });
+    }
+
+    res.json({ totalRevenue, totalOrders, totalProducts, totalUsers, statusCounts, topProducts, last7Days });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =======================
+   START SERVER
+======================= */
 app.listen(5000, () => console.log("Server running on port 5000 🚀"));
